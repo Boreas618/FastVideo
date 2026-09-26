@@ -400,3 +400,38 @@ def test_compile_model_regions_requires_conditions_and_matches(monkeypatch) -> N
 
     with pytest.raises(ValueError, match="matched"):
         _compile_model_regions(_NoMatch(), {})
+
+
+@pytest.mark.parametrize("configured_limit, admitted", [(None, False), ("8", True)])
+def test_inference_recompile_limit_sizes_shared_block_cache(configured_limit, admitted, monkeypatch) -> None:
+    # Five static shapes need five cache entries in the code object that all
+    # three blocks share; the process-wide limit below admits only two.
+    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 2)
+    if configured_limit is None:
+        monkeypatch.delenv("FASTVIDEO_INFERENCE_RECOMPILE_LIMIT", raising=False)
+    else:
+        monkeypatch.setenv("FASTVIDEO_INFERENCE_RECOMPILE_LIMIT", configured_limit)
+    torch._dynamo.reset()
+    model = _Toy()
+    _compile_model_regions(model, {"backend": "eager", "dynamic": False})
+
+    @torch.no_grad()
+    def serve_shapes() -> None:
+        for rows in range(1, 6):
+            model(torch.randn(rows, 4))
+
+    try:
+        if admitted:
+            serve_shapes()
+        else:
+            with pytest.raises(torch._dynamo.exc.FailOnRecompileLimitHit):
+                serve_shapes()
+    finally:
+        torch._dynamo.reset()
+
+
+def test_inference_recompile_limit_rejects_non_positive_values(monkeypatch) -> None:
+    monkeypatch.setenv("FASTVIDEO_INFERENCE_RECOMPILE_LIMIT", "0")
+    monkeypatch.setattr(fsdp_load.torch, "compile", lambda fn, **kwargs: fn)
+    with pytest.raises(ValueError, match="RECOMPILE_LIMIT"):
+        _compile_model_regions(_Toy(), {})

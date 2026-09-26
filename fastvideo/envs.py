@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     FASTVIDEO_FA4: bool = False
     FASTVIDEO_MINIMAX_H3_FA4_PACKED_VARLEN: bool = False
     FASTVIDEO_INFERENCE_TORCH_COMPILE: bool = False
+    FASTVIDEO_INFERENCE_RECOMPILE_LIMIT: int | None = None
     FASTVIDEO_MINIMAX_H3_FUSIONS: str = ""
     FASTVIDEO_VAE_PARALLEL_DECODE: bool = False
     FASTVIDEO_VAE_PARALLEL_ENCODE: bool = False
@@ -242,6 +243,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fastvideo/models/loader/fsdp_load.py.
     "FASTVIDEO_INFERENCE_TORCH_COMPILE":
     lambda: os.getenv("FASTVIDEO_INFERENCE_TORCH_COMPILE", "0") != "0",
+
+    # Dynamo cache entries per compiled code object for inference regional
+    # compile. Every block of one class shares a single code object, so a
+    # server needs one entry for each specialization of every request shape
+    # it admits; with fullgraph=True, exceeding the limit fails the request.
+    # Unset keeps the process-wide Dynamo setting.
+    "FASTVIDEO_INFERENCE_RECOMPILE_LIMIT":
+    lambda: (int(os.environ["FASTVIDEO_INFERENCE_RECOMPILE_LIMIT"])
+             if os.environ.get("FASTVIDEO_INFERENCE_RECOMPILE_LIMIT") else None),
 
     # If set (=1), MiniMax-H3 VAE decode (and, with the ENCODE variant,
     # reference-video encode) round-robins its temporal chunks across the

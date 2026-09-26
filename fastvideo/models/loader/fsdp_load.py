@@ -19,6 +19,7 @@ from torch.distributed._tensor import distribute_tensor
 from torch.distributed.fsdp import (CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy, fully_shard)
 from torch.nn.modules.module import _IncompatibleKeys
 
+import fastvideo.envs as envs
 from fastvideo.logger import init_logger
 from fastvideo.models.loader.lora_patch import DenseLoRAPatch
 from fastvideo.models.loader.utils import (get_param_names_mapping, hf_to_custom_state_dict)
@@ -443,6 +444,13 @@ def _compile_model_regions(model: nn.Module, compile_kwargs: dict[str, Any]) -> 
                          "(emulate_precision_casts) and cannot be combined "
                          "with torch_compile_kwargs['mode']. Remove 'mode' or "
                          "express its effect via torch_compile_kwargs['options'].")
+    recompile_limit = envs.FASTVIDEO_INFERENCE_RECOMPILE_LIMIT
+    if recompile_limit is not None:
+        if recompile_limit < 1:
+            raise ValueError(f"FASTVIDEO_INFERENCE_RECOMPILE_LIMIT must be positive, got {recompile_limit}")
+        # Regions compiled from one class share a Dynamo cache. Size it to
+        # the deployment's admitted shapes before the first capture.
+        torch._dynamo.config.recompile_limit = recompile_limit
     kwargs = {**compile_kwargs, "fullgraph": True}
     options = {"emulate_precision_casts": True}
     options.update(kwargs.get("options") or {})
