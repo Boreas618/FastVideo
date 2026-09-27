@@ -22,6 +22,19 @@ import torch
 
 from fastvideo.profiler import nvtx_range
 
+
+def test_nvtx_range_preserves_fullgraph_compilation(monkeypatch):
+    """Optional markers must not break a compiled numerical region."""
+    monkeypatch.setenv("FASTVIDEO_NVTX_PROFILE", "1")
+
+    def forward(value):
+        with nvtx_range("compiled.numerical_region"):
+            return value.square() + 2
+
+    compiled = torch.compile(forward, backend="eager", fullgraph=True)
+    for value in (torch.arange(8, dtype=torch.float32), torch.ones(8)):
+        torch.testing.assert_close(compiled(value), value.square() + 2)
+
 # Five-window child: ops before any region, inside a region, between regions,
 # inside a second (short-named) region, after the last region. Exits without
 # calling stop() — export must happen via the atexit hook. Each window is

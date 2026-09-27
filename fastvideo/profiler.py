@@ -44,9 +44,12 @@ def nvtx_range(name: str):
 
     ``FASTVIDEO_NVTX_PROFILE=1`` enables the marker. The context manager stays
     a no-op without CUDA so call sites can remain shared with CPU tests.
+    Compiled regions omit Python NVTX markers: the integer-returning NVTX
+    calls cannot be captured by Dynamo. Enclosing eager ranges still mark
+    compiled execution, whose kernels remain visible to CUDA profilers.
     """
     enabled = envs.FASTVIDEO_NVTX_PROFILE and torch.cuda.is_available()
-    if not enabled:
+    if not enabled or torch.compiler.is_compiling():
         yield
         return
 
