@@ -18,6 +18,8 @@ from fastvideo.configs.pipelines.minimax_h3 import MiniMaxH3PipelineConfig
 from fastvideo.fastvideo_args import FastVideoArgs
 from fastvideo.logger import init_logger
 from fastvideo.models.hf_transformer_utils import get_diffusers_config
+from fastvideo.models.loader.component_loader import transformer_weight_files
+from fastvideo.models.loader.weight_utils import safetensors_weights_iterator
 from fastvideo.pipelines.basic.minimax_h3.stages import (
     MiniMaxH3AudioDecodingStage,
     MiniMaxH3ConditioningStage,
@@ -26,9 +28,11 @@ from fastvideo.pipelines.basic.minimax_h3.stages import (
     MiniMaxH3LatentPreparationStage,
     MiniMaxH3VideoDecodingStage,
 )
+from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_denoising import dmd_target_step_timesteps
 from fastvideo.pipelines.composed_pipeline_base import ComposedPipelineBase
 from fastvideo.pipelines.lora_pipeline import LoRAPipeline
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
+from fastvideo.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -89,6 +93,41 @@ def _apply_h3_checkpoint_arch_configs(model_path: str, fastvideo_args: FastVideo
 
 def _use_taeh3_t2va(fastvideo_args: FastVideoArgs | None, *, ref2va: bool) -> bool:
     return (not ref2va) and getattr(fastvideo_args, "video_decode_backend", "h3-vae") == "taeh3"
+
+
+def _adaln_table_enabled(fastvideo_args: FastVideoArgs) -> bool:
+    return bool(getattr(fastvideo_args.pipeline_config.dit_config, "adaln_table", False))
+
+
+def adaln_table_conflicts(fastvideo_args: FastVideoArgs, *, ref2va: bool, deferred_load: bool) -> list[str]:
+    """Return why ``dit_config.adaln_table`` cannot serve this deployment; empty when it can.
+
+    The table is built once, when the pipeline initializes, for a resident,
+    unquantized, unadapted transformer that runs eagerly or under the
+    inference regional compile, and for the text-to-video/audio steps of the
+    checkpoint's fixed DMD schedule.
+    """
+    conflicts = []
+    if fastvideo_args.training_mode:
+        conflicts.append("training")
+    if fastvideo_args.use_fsdp_inference:
+        conflicts.append("use_fsdp_inference")
+    if fastvideo_args.dit_cpu_offload:
+        conflicts.append("dit_cpu_offload")
+    if fastvideo_args.dit_layerwise_offload:
+        conflicts.append("dit_layerwise_offload")
+    if fastvideo_args.lora_path is not None:
+        conflicts.append("lora_path (adapters change the AdaLN weights the table is built from)")
+    if fastvideo_args.pipeline_config.dit_config.quant_config is not None:
+        conflicts.append("transformer quantization")
+    if fastvideo_args.enable_torch_compile and not fastvideo_args.inference_torch_compile:
+        conflicts.append("pipeline-level transformer torch.compile (enable_torch_compile without "
+                         "inference_torch_compile)")
+    if deferred_load:
+        conflicts.append("deferred transformer loading (lazy_module_load or h3_sequential_load)")
+    if ref2va:
+        conflicts.append("Ref2VA (its condition rows add timesteps outside the text-to-video/audio schedule)")
+    return conflicts
 
 
 class MiniMaxH3BasePipeline(LoRAPipeline, ComposedPipelineBase):
@@ -160,6 +199,42 @@ class MiniMaxH3BasePipeline(LoRAPipeline, ComposedPipelineBase):
             if shift is None or not math.isfinite(float(shift)) or float(shift) <= 0:
                 raise ValueError(f"MiniMax-H3 {modality} scheduler must expose a positive finite shift, got {shift}.")
         self._load_checkpoint_schedule(fastvideo_args)
+        if _adaln_table_enabled(fastvideo_args):
+            self._build_adaln_table(fastvideo_args)
+
+    def _build_adaln_table(self, fastvideo_args: FastVideoArgs) -> None:
+        """Precompute the transformer's AdaLN projections for the checkpoint's fixed schedule.
+
+        The AdaLN tensors stream from the transformer's own weight files onto
+        its device, one layer at a time and broadcast within the node like
+        the transformer load, so the projection weights never become resident.
+        """
+        if not (Path(self.model_path) / "fastvideo_inference.json").is_file():
+            raise ValueError("MiniMax-H3 adaln_table needs the checkpoint's fixed DMD schedule "
+                             "(fastvideo_inference.json).")
+        steps = fastvideo_args.pipeline_config.dmd_denoising_steps
+        assert steps is not None, "_load_checkpoint_schedule sets the checkpoint's DMD rungs"
+        transformer = self.get_module("transformer")
+        step_timesteps = dmd_target_step_timesteps(self.get_module("scheduler"), self.get_module("audio_scheduler"),
+                                                   steps)
+        weight_files = transformer_weight_files(fastvideo_args.model_paths["transformer"], fastvideo_args)
+        projection_weights = safetensors_weights_iterator(weight_files,
+                                                          to_cpu=False,
+                                                          name_filter=transformer.is_adaln_projection_key)
+        logger.info("Building MiniMax-H3 AdaLN table for DMD rungs %s: timesteps per step %s", steps,
+                    [timesteps.tolist() for timesteps in step_timesteps])
+        transformer.build_adaln_table(
+            step_timesteps,
+            projection_weights,
+            param_dtype=PRECISION_TO_TYPE[fastvideo_args.pipeline_config.dit_precision],
+            compile_kwargs=transformer.regional_compile_kwargs,
+        )
+
+    def set_lora_adapter(self, *args: Any, **kwargs: Any) -> None:
+        if self.fastvideo_args is not None and _adaln_table_enabled(self.fastvideo_args):
+            raise RuntimeError("MiniMax-H3 adaln_table precomputes the AdaLN projections from the base weights; "
+                               "LoRA adapters are unsupported with it.")
+        super().set_lora_adapter(*args, **kwargs)
 
     def _load_checkpoint_schedule(self, fastvideo_args: FastVideoArgs) -> None:
         """A distilled export's schedule is explicit; never silently use a uniform grid."""
@@ -237,7 +312,16 @@ class MiniMaxH3BasePipeline(LoRAPipeline, ComposedPipelineBase):
                      fastvideo_args: FastVideoArgs,
                      loaded_modules: dict[str, torch.nn.Module] | None = None) -> dict[str, Any]:
         """Load the Qwen3-VL conditioner first; defer DiT and VAEs until after encode."""
-        if not self._defer_denoise_modules(fastvideo_args):
+        defer_denoise_modules = self._defer_denoise_modules(fastvideo_args)
+        if _adaln_table_enabled(fastvideo_args):
+            conflicts = adaln_table_conflicts(
+                fastvideo_args,
+                ref2va=self._ref2va,
+                deferred_load=defer_denoise_modules or self._lazy_module_load_enabled(fastvideo_args),
+            )
+            if conflicts:
+                raise ValueError("MiniMax-H3 dit_config.adaln_table is incompatible with: " + "; ".join(conflicts))
+        if not defer_denoise_modules:
             if _use_taeh3_t2va(fastvideo_args, ref2va=self._ref2va):
                 saved = list(self.required_config_modules)
                 self._required_config_modules = [name for name in saved if name != "vae"]

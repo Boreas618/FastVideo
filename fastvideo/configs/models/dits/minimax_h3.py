@@ -85,3 +85,8 @@ class MiniMaxH3Config(DiTConfig):
     # FastVideo's Fully Sharded Data Parallel (FSDP) loading path requires one
     # parameter dtype, while H3 inference keeps boundary projections in FP32.
     uniform_parameter_dtype: bool = False
+    # Inference with the checkpoint's fixed DMD schedule. The per-block and
+    # final AdaLN projections are not built or loaded; the pipeline computes
+    # their outputs for every schedule step once at load time, streaming one
+    # checkpoint layer at a time, and the transformer reads them per step.
+    adaln_table: bool = False

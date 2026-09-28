@@ -500,6 +500,16 @@ def build_row_timesteps(
     return torch.unique(row_timesteps, sorted=True, return_inverse=True)
 
 
+def target_row_timesteps(video_timestep: float, audio_timestep: float) -> torch.Tensor:
+    """Distinct FP32 row timesteps of a layout without condition rows.
+
+    Text and video rows take the video timestep and audio rows the audio
+    timestep, so this equals ``build_row_timesteps(layout, ...)[0]`` for any
+    text-to-video/audio layout.
+    """
+    return torch.unique(torch.tensor((video_timestep, audio_timestep), dtype=torch.float32), sorted=True)
+
+
 def keyframe_condition_noise(
     condition_latent_shapes: tuple[tuple[int, int, int], ...],
     patch_size: tuple[int, int, int],

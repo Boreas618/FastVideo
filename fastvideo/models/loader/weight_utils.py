@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import tempfile
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 
 import filelock
@@ -147,10 +147,12 @@ def _get_initialized_node_group():
     return None
 
 
-def safetensors_weights_iterator(hf_weights_files: list[str],
-                                 to_cpu: bool = False,
-                                 broadcast: bool = True,
-                                 async_broadcast: bool = False) -> Generator[tuple[str, torch.Tensor], None, None]:
+def safetensors_weights_iterator(
+        hf_weights_files: list[str],
+        to_cpu: bool = False,
+        broadcast: bool = True,
+        async_broadcast: bool = False,
+        name_filter: Callable[[str], bool] | None = None) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
     Args:
         hf_weights_files: List of safetensor files to load.
@@ -159,6 +161,8 @@ def safetensors_weights_iterator(hf_weights_files: list[str],
         broadcast: Whether local rank 0 should read GPU weights and broadcast them to the other local ranks.
         async_broadcast: Whether to overlap loading from disk and broadcasting to other ranks. If True,
             must iterate over all the weights before use. Only used when broadcast is True and to_cpu is False.
+        name_filter: When set, only tensors whose checkpoint name it accepts are read, broadcast and yielded.
+            Every local rank must pass the same filter so their broadcast sequences stay aligned.
     """
     node_group = _get_initialized_node_group()
     local_rank = node_group.local_rank if node_group is not None else int(os.environ.get("LOCAL_RANK", 0))
@@ -176,6 +180,8 @@ def safetensors_weights_iterator(hf_weights_files: list[str],
     ):
         with safe_open(st_file, framework="pt", device=device) as f:
             for name in f.keys():  # noqa: SIM118
+                if name_filter is not None and not name_filter(name):
+                    continue
                 if to_cpu:
                     param = f.get_tensor(name)
                 elif broadcast and node_group is not None:

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import torch
@@ -17,6 +18,7 @@ from fastvideo.pipelines.basic.minimax_h3.packing import (
     MINIMAX_H3_KEYFRAME_NOISE_AUG,
     MiniMaxH3PackedLayout,
     build_row_timesteps,
+    target_row_timesteps,
 )
 from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_latent_preparation import MINIMAX_H3_LAYOUT_KEY
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
@@ -43,6 +45,40 @@ def _h3_vsa_metadata_builder(transformer: Any, fastvideo_args: FastVideoArgs) ->
     if backend.get_name() != "VIDEO_SPARSE_ATTN_H3":
         return None
     return backend.get_builder_cls()()
+
+
+def set_dmd_schedule(scheduler: Any, audio_scheduler: Any, steps: list[int], grid_points: int,
+                     device: torch.device | str) -> None:
+    """Run the trained rungs, shifting the shared noise clock once per modality."""
+    if (not steps or any(type(step) is not int or not 0 < step <= 1000 for step in steps)
+            or any(left <= right for left, right in zip(steps, steps[1:], strict=False))):
+        raise ValueError("MiniMax-H3 DMD rungs must be strictly decreasing integers in (0, 1000].")
+    if grid_points != len(steps) + 1:
+        raise ValueError("MiniMax-H3 num_inference_steps counts sigma-grid points: "
+                         f"{len(steps)} DMD forwards require {len(steps) + 1} grid points, got {grid_points}.")
+    base = torch.tensor([step / 1000.0 for step in steps] + [0.0], dtype=torch.float32)
+    for modality_scheduler in (scheduler, audio_scheduler):
+        shift = float(modality_scheduler.shift)
+        sigmas = shift * base / (1 + (shift - 1) * base)
+        # Explicit sigmas are already shifted. Scheduler timesteps are H3
+        # clean time (1 - sigma); passing integer rungs to step() is wrong.
+        modality_scheduler.set_timesteps(sigmas=sigmas, device=device)
+
+
+def dmd_target_step_timesteps(scheduler: Any, audio_scheduler: Any, steps: list[int]) -> list[torch.Tensor]:
+    """Return the host ``timestep`` tensor of every DMD step for layouts without condition rows.
+
+    The schedule runs on copies of the schedulers through the same code as the
+    denoising loop, so these are exactly the distinct timesteps the loop
+    passes to the transformer for text-to-video/audio requests.
+    """
+    video_scheduler = copy.deepcopy(scheduler)
+    audio_scheduler = copy.deepcopy(audio_scheduler)
+    set_dmd_schedule(video_scheduler, audio_scheduler, steps, len(steps) + 1, "cpu")
+    return [
+        target_row_timesteps(float(video_timestep.item()), float(audio_timestep.item()))
+        for video_timestep, audio_timestep in zip(video_scheduler.timesteps, audio_scheduler.timesteps, strict=True)
+    ]
 
 
 def _h3_vsa_prefix_segments(layout: MiniMaxH3PackedLayout, patch_size: tuple[int, int, int]) -> tuple[int, ...]:
@@ -72,19 +108,7 @@ class MiniMaxH3DenoisingStage(PipelineStage):
 
     def _set_dmd_schedule(self, steps: list[int], grid_points: int, device: torch.device) -> None:
         """Run the trained rungs, shifting the shared noise clock once per modality."""
-        if (not steps or any(type(step) is not int or not 0 < step <= 1000 for step in steps)
-                or any(left <= right for left, right in zip(steps, steps[1:], strict=False))):
-            raise ValueError("MiniMax-H3 DMD rungs must be strictly decreasing integers in (0, 1000].")
-        if grid_points != len(steps) + 1:
-            raise ValueError("MiniMax-H3 num_inference_steps counts sigma-grid points: "
-                             f"{len(steps)} DMD forwards require {len(steps) + 1} grid points, got {grid_points}.")
-        base = torch.tensor([step / 1000.0 for step in steps] + [0.0], dtype=torch.float32)
-        for scheduler in (self.scheduler, self.audio_scheduler):
-            shift = float(scheduler.shift)
-            sigmas = shift * base / (1 + (shift - 1) * base)
-            # Explicit sigmas are already shifted. Scheduler timesteps are H3
-            # clean time (1 - sigma); passing integer rungs to step() is wrong.
-            scheduler.set_timesteps(sigmas=sigmas, device=device)
+        set_dmd_schedule(self.scheduler, self.audio_scheduler, steps, grid_points, device)
 
     def verify_input(self, batch: ForwardBatch, fastvideo_args: FastVideoArgs) -> VerificationResult:
         result = VerificationResult()
@@ -129,6 +153,10 @@ class MiniMaxH3DenoisingStage(PipelineStage):
         if len(video_timesteps) != len(audio_timesteps):
             raise ValueError("MiniMax-H3 video and audio schedules must have the same number of intervals.")
 
+        # An AdaLN-table transformer only checks each step's distinct
+        # timesteps against its table key on the host, so it gets the host
+        # tensor and the check needs no device synchronization.
+        host_timesteps = getattr(self.transformer, "adaln_table", None) is not None
         row_timestep_plan = []
         for video_timestep, audio_timestep in zip(video_timesteps, audio_timesteps, strict=True):
             video_value = float(video_timestep.item())
@@ -140,7 +168,7 @@ class MiniMaxH3DenoisingStage(PipelineStage):
                 condition_video_timestep=max(video_value, MINIMAX_H3_KEYFRAME_NOISE_AUG),
                 condition_audio_timestep=1.0,
             )
-            row_timestep_plan.append((unique.to(device), inverse.to(device)))
+            row_timestep_plan.append((unique if host_timesteps else unique.to(device), inverse.to(device)))
         batch.timesteps = video_timesteps
 
         position_ids = layout.position_ids.to(device)

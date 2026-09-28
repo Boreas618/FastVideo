@@ -279,7 +279,12 @@ def maybe_load_fsdp_model(
     # Host offload is already disabled on unified memory (GB10). Staging the
     # 35B FastH3 DiT on CPU and then copying to CUDA doubled that working set
     # and took minutes. Follow cpu_offload: read onto the accelerator.
-    weight_iterator = safetensors_weights_iterator(weight_dir_list, to_cpu=cpu_offload)
+    # A model that deliberately does not build some checkpoint modules names
+    # their keys; those tensors are never read and every other key still loads
+    # strictly.
+    is_omitted_key = getattr(model, "is_omitted_checkpoint_key", None)
+    name_filter = (lambda name: not is_omitted_key(name)) if callable(is_omitted_key) else None
+    weight_iterator = safetensors_weights_iterator(weight_dir_list, to_cpu=cpu_offload, name_filter=name_filter)
     logger.info("Loading transformer weights with to_cpu=%s", cpu_offload)
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
     dense_lora_patch = DenseLoRAPatch.from_adapter(
@@ -421,17 +426,12 @@ def _enable_regional_attention_compile(model: nn.Module) -> int:
     return enabled_count
 
 
-def _compile_model_regions(model: nn.Module, compile_kwargs: dict[str, Any]) -> int:
-    """Compile repeated mathematical regions of a loaded model.
+def regional_compile_kwargs(compile_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return the ``torch.compile`` kwargs regional compile applies to each region.
 
-    Only the selected module ``forward`` is replaced. This keeps activation
-    checkpoint wrappers structurally transparent while any module-level hooks
-    (FSDP pre/post, layerwise offload) execute outside the compiled region.
+    User kwargs are kept, with ``fullgraph=True`` and the inductor option
+    ``emulate_precision_casts=True`` injected unless the user overrides it.
     """
-    compile_conditions = getattr(model, "_compile_conditions", None)
-    if not compile_conditions:
-        raise ValueError(f"{type(model).__name__} does not declare _compile_conditions")
-
     if compile_kwargs.get("fullgraph", True) is not True:
         raise ValueError("Regional compile requires fullgraph=True")
     if "mode" in compile_kwargs:
@@ -444,6 +444,27 @@ def _compile_model_regions(model: nn.Module, compile_kwargs: dict[str, Any]) -> 
                          "(emulate_precision_casts) and cannot be combined "
                          "with torch_compile_kwargs['mode']. Remove 'mode' or "
                          "express its effect via torch_compile_kwargs['options'].")
+    kwargs = {**compile_kwargs, "fullgraph": True}
+    options = {"emulate_precision_casts": True}
+    options.update(kwargs.get("options") or {})
+    kwargs["options"] = options
+    return kwargs
+
+
+def _compile_model_regions(model: nn.Module, compile_kwargs: dict[str, Any]) -> int:
+    """Compile repeated mathematical regions of a loaded model.
+
+    Only the selected module ``forward`` is replaced. This keeps activation
+    checkpoint wrappers structurally transparent while any module-level hooks
+    (FSDP pre/post, layerwise offload) execute outside the compiled region.
+    The applied kwargs are recorded as ``model.regional_compile_kwargs`` so
+    work that must match the compiled regions can reuse them.
+    """
+    compile_conditions = getattr(model, "_compile_conditions", None)
+    if not compile_conditions:
+        raise ValueError(f"{type(model).__name__} does not declare _compile_conditions")
+
+    kwargs = regional_compile_kwargs(compile_kwargs)
     recompile_limit = envs.FASTVIDEO_INFERENCE_RECOMPILE_LIMIT
     if recompile_limit is not None:
         if recompile_limit < 1:
@@ -451,10 +472,6 @@ def _compile_model_regions(model: nn.Module, compile_kwargs: dict[str, Any]) -> 
         # Regions compiled from one class share a Dynamo cache. Size it to
         # the deployment's admitted shapes before the first capture.
         torch._dynamo.config.recompile_limit = recompile_limit
-    kwargs = {**compile_kwargs, "fullgraph": True}
-    options = {"emulate_precision_casts": True}
-    options.update(kwargs.get("options") or {})
-    kwargs["options"] = options
     compiled_count = 0
     for name, submodule in list(model.named_modules()):
         if not name:
@@ -469,6 +486,7 @@ def _compile_model_regions(model: nn.Module, compile_kwargs: dict[str, Any]) -> 
 
     if compiled_count == 0:
         raise ValueError(f"No submodules in {type(model).__name__} matched _compile_conditions")
+    model.regional_compile_kwargs = kwargs
     logger.info(
         "Enabled regional torch.compile for %d submodules in %s with kwargs=%s",
         compiled_count,

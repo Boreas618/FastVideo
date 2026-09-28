@@ -1026,6 +1026,31 @@ def _collect_safetensors_keys(safetensors_list: list) -> set:
     return all_keys
 
 
+def transformer_weight_files(model_path: str, fastvideo_args: FastVideoArgs) -> list[str]:
+    """Return the safetensors files the transformer at ``model_path`` loads its weights from.
+
+    ``init_weights_from_safetensors`` (``init_weights_from_safetensors_2``
+    for a ``transformer_2`` component) replaces the checkpoint's own files,
+    except while loading DMD teacher/critic transformers.
+    """
+    custom_weights_path = getattr(fastvideo_args, "init_weights_from_safetensors", None)
+    use_custom_weights = (custom_weights_path and os.path.exists(custom_weights_path)
+                          and not hasattr(fastvideo_args, "_loading_teacher_critic_model"))
+    if not use_custom_weights:
+        safetensors_list = glob.glob(os.path.join(str(model_path), "*.safetensors"))
+        if not safetensors_list:
+            raise ValueError(f"No safetensors files found in {model_path}")
+        return safetensors_list
+
+    if "transformer_2" in model_path:
+        custom_weights_path = getattr(fastvideo_args, "init_weights_from_safetensors_2", None)
+    assert custom_weights_path is not None, ("Custom initialization weights must be provided")
+    if os.path.isdir(custom_weights_path):
+        return glob.glob(os.path.join(str(custom_weights_path), "*.safetensors"))
+    assert custom_weights_path.endswith(".safetensors"), ("Custom initialization weights must be a safetensors file")
+    return [custom_weights_path]
+
+
 class TransformerLoader(ComponentLoader):
     """Loader for transformer."""
 
@@ -1075,21 +1100,7 @@ class TransformerLoader(ComponentLoader):
             weight_keys = _collect_safetensors_keys(safetensors_list)
             update_fn(weight_keys)
 
-        # Check if we should use custom initialization weights
-        custom_weights_path = getattr(fastvideo_args, "init_weights_from_safetensors", None)
-        use_custom_weights = (custom_weights_path and os.path.exists(custom_weights_path)
-                              and not hasattr(fastvideo_args, "_loading_teacher_critic_model"))
-
-        if use_custom_weights:
-            if "transformer_2" in model_path:
-                custom_weights_path = getattr(fastvideo_args, "init_weights_from_safetensors_2", None)
-            assert custom_weights_path is not None, ("Custom initialization weights must be provided")
-            if os.path.isdir(custom_weights_path):
-                safetensors_list = glob.glob(os.path.join(str(custom_weights_path), "*.safetensors"))
-            else:
-                assert custom_weights_path.endswith(".safetensors"), (
-                    "Custom initialization weights must be a safetensors file")
-                safetensors_list = [custom_weights_path]
+        safetensors_list = transformer_weight_files(model_path, fastvideo_args)
 
         logger.info(
             "Loading model from %s safetensors files: %s",
