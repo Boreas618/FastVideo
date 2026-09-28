@@ -69,3 +69,8 @@ class MiniMaxH3VideoVAEConfig(VAEConfig):
 
     tile_sample_min_overlap_height: int = 64
     tile_sample_min_overlap_width: int = 64
+    # Store the decoder's linear weights in FP16 once loaded. Decode runs under
+    # FP16 autocast, which casts these FP32 weights to the same FP16 values on
+    # every call, so the output is unchanged while their memory halves.
+    # Biases, norms, residual scales and register tokens stay FP32.
+    fp16_decoder_weights: bool = False

@@ -527,6 +527,12 @@ def _is_minimax_h3_video_vae_decoder(name: str, submodule: nn.Module) -> bool:
     return name == "decoder" and isinstance(submodule, MiniMaxH3VideoViTDecoder3d)
 
 
+def _store_loaded_decoder_weights_fp16(module: "AutoencoderKLMiniMaxH3", incompatible_keys: object) -> None:
+    """``load_state_dict`` post-hook for ``fp16_decoder_weights``."""
+    del incompatible_keys
+    module.store_decoder_weights_fp16()
+
+
 class AutoencoderKLMiniMaxH3(nn.Module):
     """MiniMax-H3 causal encoder and ViT decoder with exact release geometry."""
 
@@ -538,6 +544,9 @@ class AutoencoderKLMiniMaxH3(nn.Module):
     # ``prepare_for_compile`` flips this per instance when the pipeline opts
     # into ``enable_torch_compile_vae``; default instances stay fully eager.
     _tile_helpers_compiled = False
+    # ``store_decoder_weights_fp16`` flips this per instance; decode then
+    # requires FP16 autocast.
+    _decoder_weights_fp16 = False
 
     def __init__(self, config: MiniMaxH3VideoVAEConfig) -> None:
         super().__init__()
@@ -612,22 +621,45 @@ class AutoencoderKLMiniMaxH3(nn.Module):
         )
         # The released encoder and decoder stay in FP32 for both weights and compute.
         self.float()
+        if config.fp16_decoder_weights:
+            # Loaded FP32 weights are converted on their device with the same
+            # FP32 -> FP16 cast FP16 autocast applies to them at every decode.
+            self.register_load_state_dict_post_hook(_store_loaded_decoder_weights_fp16)
+
+    def store_decoder_weights_fp16(self) -> None:
+        """Keep every decoder linear weight in FP16 on its current device.
+
+        Decode runs under FP16 autocast, whose linear kernels consume FP16
+        casts of these weights; storing the cast once feeds them identical
+        values. Biases (about 2 MB) stay FP32: a compiled decoder may fuse a
+        bias cast into a pointwise kernel that skips its FP16 rounding, so
+        pre-rounded biases could change compiled output. Norms, residual
+        scales and register tokens stay FP32 because they are computed in
+        FP32. Decoding with these weights requires FP16 autocast.
+        """
+        for module in self.decoder.modules():
+            if isinstance(module, nn.Linear):
+                module.weight.data = module.weight.data.to(torch.float16)
+        self._decoder_weights_fp16 = True
 
     def to(self, *args, **kwargs) -> "AutoencoderKLMiniMaxH3":
         device, dtype, non_blocking, memory_format = torch._C._nn._parse_to(*args, **kwargs)
-        if dtype is None or dtype == torch.float32:
+        if dtype is None:
             return super().to(*args, **kwargs)
         if not torch.is_floating_point(torch.empty((), dtype=dtype)):
             return super().to(*args, **kwargs)
 
-        to_kwargs = {
-            "device": device,
-            "dtype": torch.float32,
-            "non_blocking": non_blocking,
-        }
-        if memory_format is not None:
-            to_kwargs["memory_format"] = memory_format
-        return super().to(**to_kwargs)
+        # Floating requests keep the release storage: FP16 decoder weights
+        # stay FP16 and every other floating tensor is FP32.
+        def convert(tensor: torch.Tensor) -> torch.Tensor:
+            storage_dtype = None
+            if tensor.is_floating_point():
+                storage_dtype = torch.float16 if tensor.dtype == torch.float16 else torch.float32
+            if memory_format is not None and tensor.dim() in (4, 5):
+                return tensor.to(device, storage_dtype, non_blocking, memory_format=memory_format)
+            return tensor.to(device, storage_dtype, non_blocking)
+
+        return self._apply(convert)
 
     def half(self) -> "AutoencoderKLMiniMaxH3":
         return self
@@ -794,6 +826,10 @@ class AutoencoderKLMiniMaxH3(nn.Module):
 
     def _decode_clip(self, z: torch.Tensor) -> torch.Tensor:
         """Decode one temporal clip, with optional overlapping spatial tiles."""
+        if (self._decoder_weights_fp16 and not (torch.is_autocast_enabled(z.device.type)
+                                                and torch.get_autocast_dtype(z.device.type) == torch.float16)):
+            raise RuntimeError("MiniMax-H3 VAE decoder weights are stored in FP16 (vae_config.fp16_decoder_weights) "
+                               f"and decode requires float16 autocast on {z.device.type}.")
         with nvtx_range("minimax_h3.vae.decode_clip"):
             if not self.use_tiling:
                 with nvtx_range("minimax_h3.vae.decode_clip.no_s_tile.post_quant_conv"):
