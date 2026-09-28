@@ -95,6 +95,24 @@ def _use_taeh3_t2va(fastvideo_args: FastVideoArgs | None, *, ref2va: bool) -> bo
     return (not ref2va) and getattr(fastvideo_args, "video_decode_backend", "h3-vae") == "taeh3"
 
 
+def unbuilt_conditioning_components(fastvideo_args: FastVideoArgs) -> list[str]:
+    """Return the config switches that leave out a media-conditioning component.
+
+    Text-to-video/audio needs none of these components; keyframe (FL2VA) and
+    reference (Ref2VA) conditioning do.
+    """
+    pipeline_config = fastvideo_args.pipeline_config
+    switches = []
+    if not pipeline_config.vae_config.load_encoder:
+        switches.append("vae_config.load_encoder=False")
+    audio_vae_config = getattr(pipeline_config, "audio_vae_config", None)
+    if audio_vae_config is not None and not audio_vae_config.load_encoder:
+        switches.append("audio_vae_config.load_encoder=False")
+    if any(not getattr(config, "load_vision_model", True) for config in pipeline_config.text_encoder_configs):
+        switches.append("text_encoder_configs[0].load_vision_model=False")
+    return switches
+
+
 def _adaln_table_enabled(fastvideo_args: FastVideoArgs) -> bool:
     return bool(getattr(fastvideo_args.pipeline_config.dit_config, "adaln_table", False))
 
@@ -321,6 +339,10 @@ class MiniMaxH3BasePipeline(LoRAPipeline, ComposedPipelineBase):
             )
             if conflicts:
                 raise ValueError("MiniMax-H3 dit_config.adaln_table is incompatible with: " + "; ".join(conflicts))
+        unbuilt = unbuilt_conditioning_components(fastvideo_args)
+        if self._ref2va and unbuilt:
+            raise ValueError("MiniMax-H3 Ref2VA encodes image, video and audio references and needs the "
+                             f"components disabled by: {', '.join(unbuilt)}")
         if not defer_denoise_modules:
             if _use_taeh3_t2va(fastvideo_args, ref2va=self._ref2va):
                 saved = list(self.required_config_modules)

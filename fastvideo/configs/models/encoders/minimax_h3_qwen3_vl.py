@@ -158,6 +158,10 @@ class MiniMaxH3Qwen3VLConfig(TextEncoderConfig):
     arch_config: TextEncoderArchConfig = field(default_factory=MiniMaxH3Qwen3VLArchConfig)
     prefix: str = "minimax_h3_qwen3_vl"
     is_chat_model: bool = False
+    # Build and load the vision tower. Text-only conditioning never runs it;
+    # with False its checkpoint tensors are skipped and image or video
+    # conditioning raises.
+    load_vision_model: bool = True
 
     def update_model_arch(self, source_model_dict: dict[str, Any]) -> None:
         flattened = dict(source_model_dict)

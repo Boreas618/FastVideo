@@ -330,6 +330,9 @@ def encode_pixels_parallel(
         raise ValueError(f"`pixels` must remain on CPU, got device={pixels.device}.")
     if pixels.dtype != torch.uint8 and not pixels.is_floating_point():
         raise TypeError(f"`pixels` must use uint8 or a floating-point dtype, got {pixels.dtype}.")
+    # Raise on every rank before any collective: ranks without a clip would
+    # otherwise wait at the rendezvous for ranks that failed.
+    vae._require_encoder()
     if group.world_size == 1:
         return vae.encode_pixels(pixels)
     if vae.use_slicing and pixels.shape[0] > 1:

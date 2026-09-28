@@ -557,6 +557,8 @@ class AutoencoderKLMiniMaxH3(nn.Module):
         self.spatial_compression_ratio = math.prod(arch.spatial_downsample_factors)
         self.temporal_compression_ratio = math.prod(arch.temporal_downsample_factors)
 
+        # ``load_encoder=False`` builds a decode-only VAE: the encoder and its
+        # moment projection are absent and every encode path raises.
         self.encoder = MiniMaxH3VideoEncoder3d(
             in_channels=arch.in_channels,
             out_channels=2 * arch.latent_channels,
@@ -567,8 +569,9 @@ class AutoencoderKLMiniMaxH3(nn.Module):
             norm_num_groups=arch.norm_num_groups,
             norm_eps=arch.norm_eps,
             spatial_padding_mode=arch.spatial_padding_mode,
-        )
-        self.quant_conv = nn.Conv3d(2 * arch.latent_channels, 2 * arch.latent_channels, kernel_size=1)
+        ) if config.load_encoder else None
+        self.quant_conv = (nn.Conv3d(2 * arch.latent_channels, 2 * arch.latent_channels, kernel_size=1)
+                           if config.load_encoder else None)
         self.post_quant_conv = nn.Conv3d(arch.latent_channels, arch.latent_channels, kernel_size=1)
         self.decoder = MiniMaxH3VideoViTDecoder3d(
             in_channels=arch.latent_channels,
@@ -625,6 +628,16 @@ class AutoencoderKLMiniMaxH3(nn.Module):
             # Loaded FP32 weights are converted on their device with the same
             # FP32 -> FP16 cast FP16 autocast applies to them at every decode.
             self.register_load_state_dict_post_hook(_store_loaded_decoder_weights_fp16)
+
+    def is_omitted_checkpoint_key(self, name: str) -> bool:
+        """Whether checkpoint key ``name`` belongs to the encoder this decode-only VAE does not build."""
+        return self.encoder is None and name.startswith(("encoder.", "quant_conv."))
+
+    def _require_encoder(self) -> None:
+        if self.encoder is None:
+            raise RuntimeError("This MiniMax-H3 video VAE was built without its encoder "
+                               "(vae_config.load_encoder=False); keyframe and reference-video conditioning "
+                               "need vae_config.load_encoder=True.")
 
     def store_decoder_weights_fp16(self) -> None:
         """Keep every decoder linear weight in FP16 on its current device.
@@ -790,6 +803,7 @@ class AutoencoderKLMiniMaxH3(nn.Module):
         return self.post_quant_conv(tile)
 
     def _encode_clip(self, x: torch.Tensor) -> torch.Tensor:
+        self._require_encoder()
         if not self.use_tiling:
             return self.quant_conv(self.encoder(x))
         height, width = x.shape[-2:]

@@ -392,6 +392,11 @@ class MiniMaxH3AudioBigVGANDecoder(nn.Module):
         return torch.clamp(hidden_states, min=-1.0, max=1.0)
 
 
+# Checkpoint namespaces of the encode path: waveform encoder, attention
+# projection and posterior moment projections.
+_ENCODER_CHECKPOINT_PREFIXES = ("encoder.", "pre_block.", "mean_proj.", "logs_proj.")
+
+
 def _is_minimax_h3_audio_vae_decoder(name: str, submodule: nn.Module) -> bool:
     """Select the audio decoder that serves the H3 VAE ``decode`` path."""
     return name == "decoder" and isinstance(submodule, MiniMaxH3AudioBigVGANDecoder)
@@ -434,18 +439,25 @@ class MiniMaxH3AudioVAE(nn.Module):
             raise ValueError(f"`latent_dim` ({arch.latent_dim}) must be a multiple of `latent_channels` "
                              f"({arch.latent_channels}).")
 
-        self.encoder = MiniMaxH3AudioEncoder(
-            d_model=arch.encoder_dim,
-            strides=encoder_rates,
-            d_latent=arch.latent_dim,
-        )
-        self.pre_block = MiniMaxH3AudioAttnProjection(
-            arch.latent_dim,
-            arch.latent_channels,
-            num_heads=arch.num_attention_heads,
-        )
-        self.mean_proj = nn.Conv1d(arch.latent_channels, arch.latent_channels, 1)
-        self.logs_proj = nn.Conv1d(arch.latent_channels, arch.latent_channels, 1)
+        # ``load_encoder=False`` builds a decode-only VAE: the waveform encoder
+        # and its latent projections are absent and ``encode`` raises.
+        self.encoder: MiniMaxH3AudioEncoder | None = None
+        self.pre_block: MiniMaxH3AudioAttnProjection | None = None
+        self.mean_proj: nn.Conv1d | None = None
+        self.logs_proj: nn.Conv1d | None = None
+        if config.load_encoder:
+            self.encoder = MiniMaxH3AudioEncoder(
+                d_model=arch.encoder_dim,
+                strides=encoder_rates,
+                d_latent=arch.latent_dim,
+            )
+            self.pre_block = MiniMaxH3AudioAttnProjection(
+                arch.latent_dim,
+                arch.latent_channels,
+                num_heads=arch.num_attention_heads,
+            )
+            self.mean_proj = nn.Conv1d(arch.latent_channels, arch.latent_channels, 1)
+            self.logs_proj = nn.Conv1d(arch.latent_channels, arch.latent_channels, 1)
 
         self.dec_in_proj = nn.Conv1d(arch.latent_channels, arch.latent_dim, 1)
         self.decoder = MiniMaxH3AudioBigVGANDecoder(
@@ -461,11 +473,19 @@ class MiniMaxH3AudioVAE(nn.Module):
         # The H3 checkpoint and waveform numerics require this component to stay FP32.
         self.float()
 
+    def is_omitted_checkpoint_key(self, name: str) -> bool:
+        """Whether checkpoint key ``name`` belongs to the encoder this decode-only VAE does not build."""
+        return self.encoder is None and name.startswith(_ENCODER_CHECKPOINT_PREFIXES)
+
     def encode(
         self,
         sample: torch.Tensor,
         return_dict: bool = True,
     ) -> MiniMaxH3AudioEncoderOutput | tuple[MiniMaxH3AudioDiagonalGaussianDistribution]:
+        if self.encoder is None:
+            raise RuntimeError("This MiniMax-H3 audio VAE was built without its encoder "
+                               "(audio_vae_config.load_encoder=False); reference-audio conditioning needs "
+                               "audio_vae_config.load_encoder=True.")
         if sample.ndim != 3 or sample.shape[1] != 1:
             raise ValueError(f"`sample` must have shape [batch_size, 1, samples], got {tuple(sample.shape)}.")
 

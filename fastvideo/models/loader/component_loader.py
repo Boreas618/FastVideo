@@ -907,6 +907,12 @@ class VAELoader(ComponentLoader):
                         break
             loaded = remapped
 
+        # A VAE built without some checkpoint modules (e.g. a decode-only
+        # MiniMax-H3 VAE) names their keys; every other key loads as usual.
+        is_omitted_key = getattr(vae, "is_omitted_checkpoint_key", None)
+        if callable(is_omitted_key):
+            loaded = {name: tensor for name, tensor in loaded.items() if not is_omitted_key(name)}
+
         # Diffusers-format AutoencoderKL checkpoints should match exactly; load
         # strictly so missing/unexpected keys are surfaced early.
         strict_load = class_name in {"AutoencoderKL", "AutoencoderKLMiniMaxH3"}
@@ -946,6 +952,8 @@ class AudioDecoderLoader(ComponentLoader):
             loaded: dict[str, torch.Tensor] = {}
             for sf_file in safetensors_list:
                 loaded.update(safetensors_load_file(sf_file))
+            # A decode-only audio VAE skips exactly its encoder's tensors.
+            loaded = {name: tensor for name, tensor in loaded.items() if not audio_vae.is_omitted_checkpoint_key(name)}
             audio_vae.load_state_dict(loaded, strict=True)
             return audio_vae.eval()
 

@@ -528,7 +528,7 @@ class MiniMaxH3Qwen3VLConditioner(TextEncoder[torch.Tensor]):
 
     def __init__(self, config: MiniMaxH3Qwen3VLConfig) -> None:
         super().__init__(config)
-        self.visual = MiniMaxH3Qwen3VLVisionModel(config)
+        self.visual = MiniMaxH3Qwen3VLVisionModel(config) if config.load_vision_model else None
         self.language_model = MiniMaxH3Qwen3VLLanguageModel(config)
 
     @property
@@ -659,6 +659,10 @@ class MiniMaxH3Qwen3VLConditioner(TextEncoder[torch.Tensor]):
             raise ValueError("pixel_values and image_grid_thw must be provided together")
         if (pixel_values_videos is None) != (video_grid_thw is None):
             raise ValueError("pixel_values_videos and video_grid_thw must be provided together")
+        if self.visual is None and (pixel_values is not None or pixel_values_videos is not None):
+            raise RuntimeError("This MiniMax-H3 Qwen3-VL conditioner was built without its vision model "
+                               "(text_encoder_configs[0].load_vision_model=False); image and video conditioning "
+                               "need load_vision_model=True.")
 
         input_ids = input_ids.unsqueeze(0)
         inputs_embeds = self.language_model.embed_tokens(input_ids)
@@ -752,7 +756,9 @@ class MiniMaxH3Qwen3VLConditioner(TextEncoder[torch.Tensor]):
         return loaded
 
     def _is_omitted_checkpoint_key(self, name: str) -> bool:
-        """Return whether a valid checkpoint key belongs to an unbuilt layer."""
+        """Return whether a valid checkpoint key belongs to an unbuilt layer or vision model."""
+        if self.visual is None and name.startswith("visual."):
+            return True
         language_model = self.language_model
         if language_model.norm is not None:
             return False
